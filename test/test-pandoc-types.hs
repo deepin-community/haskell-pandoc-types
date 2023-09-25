@@ -3,7 +3,10 @@
 import Text.Pandoc.Arbitrary ()
 import Text.Pandoc.Definition
 import Text.Pandoc.Walk
-import Text.Pandoc.Builder (singleton, plain, text, simpleTable)
+import Text.Pandoc.Builder (singleton, plain, text, simpleTable, table, emptyCell,
+                            normalizeTableHead, normalizeTableBody, normalizeTableFoot,
+                            emptyCaption, simpleFigureWith)
+import qualified Text.Pandoc.Builder as Builder
 import Data.Generics
 import Data.List (tails)
 import Test.HUnit (Assertion, assertEqual, assertFailure)
@@ -11,6 +14,7 @@ import Data.Aeson (FromJSON, ToJSON, encode, decode)
 import Test.Framework
 import Test.Framework.Providers.QuickCheck2 (testProperty)
 import Test.Framework.Providers.HUnit (testCase)
+import Test.QuickCheck (forAll, choose, Property, Arbitrary, Testable, arbitrary, Gen)
 import qualified Data.Map as M
 import Data.Text (Text)
 import qualified Data.Text as T
@@ -63,6 +67,14 @@ blocksTrans [BlockQuote xs] = xs
 blocksTrans [Div _ xs] = xs
 blocksTrans xs = xs
 
+metaValueTrans :: MetaValue -> MetaValue
+metaValueTrans (MetaBool x) = MetaBool $ not x
+metaValueTrans (MetaString xs) = MetaString $ T.toUpper xs
+metaValueTrans x = x
+
+metaTrans :: Meta -> Meta
+metaTrans (Meta metamap) = Meta $ M.mapKeys T.toUpper metamap
+
 inlineQuery :: Inline -> Text
 inlineQuery (Str xs) = xs
 inlineQuery _ = ""
@@ -77,6 +89,12 @@ blockQuery _ = []
 blocksQuery :: [Block] -> Monoid.Sum Int
 blocksQuery = Monoid.Sum . length
 
+metaValueQuery :: MetaValue -> Text
+metaValueQuery (MetaString xs) = xs
+metaValueQuery _ = ""
+
+metaQuery :: Meta -> Monoid.Sum Int
+metaQuery (Meta metamap) = Monoid.Sum $ M.size metamap
 
 prop_roundtrip :: Pandoc -> Bool
 prop_roundtrip doc = case decode $ encode doc :: (Maybe Pandoc) of
@@ -102,6 +120,11 @@ testEncodeDecode :: (Show a, Eq a, ToJSON a, FromJSON a)
 testEncodeDecode msg pair = testGroup msg [ testCase "Encoding" $ testEncode pair
                                           , testCase "Decoding" $ testDecode pair
                                           ]
+
+t_meta :: (Meta, ByteString)
+t_meta = ( Meta $ M.fromList [("foo", MetaBool True)]
+         , [s|{"foo":{"t":"MetaBool","c":true}}|]
+         )
 
 t_metamap :: (MetaValue, ByteString)
 t_metamap = ( MetaMap $
@@ -150,7 +173,7 @@ t_citation = ( Citation { citationId = "jameson:unconscious",
                           citationMode = NormalCitation,
                           citationNoteNum = 0,
                           citationHash = 0}
-             , [s|{"citationSuffix":[{"t":"Space"},{"t":"Str","c":"123"}],"citationNoteNum":0,"citationMode":{"t":"NormalCitation"},"citationPrefix":[{"t":"Str","c":"cf"}],"citationId":"jameson:unconscious","citationHash":0}|]
+             , [s|{"citationId":"jameson:unconscious","citationPrefix":[{"t":"Str","c":"cf"}],"citationSuffix":[{"t":"Space"},{"t":"Str","c":"123"}],"citationMode":{"t":"NormalCitation"},"citationNoteNum":0,"citationHash":0}|]
              )
 
 t_displaymath :: (MathType, ByteString)
@@ -168,6 +191,11 @@ t_str = ( Str "Hello"
 t_emph :: (Inline, ByteString)
 t_emph = ( Emph [Str "Hello"]
          , [s|{"t":"Emph","c":[{"t":"Str","c":"Hello"}]}|]
+         )
+
+t_underline :: (Inline, ByteString)
+t_underline = ( Underline [Str "Hello"]
+         , [s|{"t":"Underline","c":[{"t":"Str","c":"Hello"}]}|]
          )
 
 t_strong :: (Inline, ByteString)
@@ -212,7 +240,7 @@ t_cite = ( Cite [Citation { citationId = "jameson:unconscious"
                 , Str "@jameson:unconscious"
                 , Space
                 , Str "12]"]
-         ,[s|{"t":"Cite","c":[[{"citationSuffix":[{"t":"Space"},{"t":"Str","c":"12"}],"citationNoteNum":0,"citationMode":{"t":"NormalCitation"},"citationPrefix":[{"t":"Str","c":"cf"}],"citationId":"jameson:unconscious","citationHash":0}],[{"t":"Str","c":"[cf"},{"t":"Space"},{"t":"Str","c":"@jameson:unconscious"},{"t":"Space"},{"t":"Str","c":"12]"}]]}|]
+         ,[s|{"t":"Cite","c":[[{"citationId":"jameson:unconscious","citationPrefix":[{"t":"Str","c":"cf"}],"citationSuffix":[{"t":"Space"},{"t":"Str","c":"12"}],"citationMode":{"t":"NormalCitation"},"citationNoteNum":0,"citationHash":0}],[{"t":"Str","c":"[cf"},{"t":"Space"},{"t":"Str","c":"@jameson:unconscious"},{"t":"Space"},{"t":"Str","c":"12]"}]]}|]
              )
 
 t_code :: (Inline, ByteString)
@@ -316,41 +344,112 @@ t_header = ( Header 2 ("id", ["kls"], [("k1", "v1"), ("k2", "v2")]) [Str "Head"]
            , [s|{"t":"Header","c":[2,["id",["kls"],[["k1","v1"],["k2","v2"]]],[{"t":"Str","c":"Head"}]]}|]
            )
 
+t_row :: (Row, ByteString)
+t_row = (Row ("id",["kls"],[("k1", "v1"), ("k2", "v2")])
+         [Cell ("", [], []) AlignRight 2 3 [Para [Str "bar"]]]
+        ,[s|[["id",["kls"],[["k1","v1"],["k2","v2"]]],[[["",[],[]],{"t":"AlignRight"},2,3,[{"t":"Para","c":[{"t":"Str","c":"bar"}]}]]]]|])
+
+t_caption :: (Caption, ByteString)
+t_caption = (Caption (Just [Str "foo"]) [Para [Str "bar"]]
+            ,[s|[[{"t":"Str","c":"foo"}],[{"t":"Para","c":[{"t":"Str","c":"bar"}]}]]|])
+
+t_tablehead :: (TableHead, ByteString)
+t_tablehead = (TableHead ("id",["kls"],[("k1", "v1"), ("k2", "v2")])
+               [Row ("id",["kls"],[("k1", "v1"), ("k2", "v2")]) []]
+              ,[s|[["id",["kls"],[["k1","v1"],["k2","v2"]]],[[["id",["kls"],[["k1","v1"],["k2","v2"]]],[]]]]|])
+
+t_tablebody :: (TableBody, ByteString)
+t_tablebody = (TableBody ("id",["kls"],[("k1", "v1"), ("k2", "v2")]) 3
+               [Row ("id",["kls"],[("k1", "v1"), ("k2", "v2")]) []]
+               [Row ("id'",["kls'"],[("k1", "v1"), ("k2", "v2")]) []]
+              ,[s|[["id",["kls"],[["k1","v1"],["k2","v2"]]],3,[[["id",["kls"],[["k1","v1"],["k2","v2"]]],[]]],[[["id'",["kls'"],[["k1","v1"],["k2","v2"]]],[]]]]|])
+
+t_tablefoot :: (TableFoot, ByteString)
+t_tablefoot = (TableFoot ("id",["kls"],[("k1", "v1"), ("k2", "v2")])
+               [Row ("id",["kls"],[("k1", "v1"), ("k2", "v2")]) []]
+              ,[s|[["id",["kls"],[["k1","v1"],["k2","v2"]]],[[["id",["kls"],[["k1","v1"],["k2","v2"]]],[]]]]|])
+
+t_cell :: (Cell, ByteString)
+t_cell = (Cell ("id",["kls"],[("k1", "v1"), ("k2", "v2")]) AlignLeft 1 1
+          [Para [Str "bar"]]
+         ,[s|[["id",["kls"],[["k1","v1"],["k2","v2"]]],{"t":"AlignLeft"},1,1,[{"t":"Para","c":[{"t":"Str","c":"bar"}]}]]|])
+
+t_rowheadcolumns :: (RowHeadColumns, ByteString)
+t_rowheadcolumns = (1
+                   ,[s|1|])
+
+t_rowspan :: (RowSpan, ByteString)
+t_rowspan = (1
+            ,[s|1|])
+
+t_colspan :: (ColSpan, ByteString)
+t_colspan = (1
+            ,[s|1|])
+
 t_table :: (Block, ByteString)
-t_table = (  Table
-             [Str "Demonstration"
-             ,Space
-             ,Str "of"
-             ,Space
-             ,Str "simple"
-             ,Space
-             ,Str "table"
-             ,Space
-             ,Str "syntax."]
-             [AlignRight
-             ,AlignLeft
-             ,AlignCenter
-             ,AlignDefault]
-             [0.0,0.0,0.0,0.0]
-            [[Plain [Str "Right"]]
-            ,[Plain [Str "Left"]]
-            ,[Plain [Str "Center"]]
-            ,[Plain [Str "Default"]]]
-            [[[Plain [Str "12"]]
-             ,[Plain [Str "12"]]
-             ,[Plain [Str "12"]]
-             ,[Plain [Str "12"]]]
-            ,[[Plain [Str "123"]]
-             ,[Plain [Str "123"]]
-             ,[Plain [Str "123"]]
-             ,[Plain [Str "123"]]]
-            ,[[Plain [Str "1"]]
-             ,[Plain [Str "1"]]
-             ,[Plain [Str "1"]]
-             ,[Plain [Str "1"]]]]
-          ,
-            [s|{"t":"Table","c":[[{"t":"Str","c":"Demonstration"},{"t":"Space"},{"t":"Str","c":"of"},{"t":"Space"},{"t":"Str","c":"simple"},{"t":"Space"},{"t":"Str","c":"table"},{"t":"Space"},{"t":"Str","c":"syntax."}],[{"t":"AlignRight"},{"t":"AlignLeft"},{"t":"AlignCenter"},{"t":"AlignDefault"}],[0,0,0,0],[[{"t":"Plain","c":[{"t":"Str","c":"Right"}]}],[{"t":"Plain","c":[{"t":"Str","c":"Left"}]}],[{"t":"Plain","c":[{"t":"Str","c":"Center"}]}],[{"t":"Plain","c":[{"t":"Str","c":"Default"}]}]],[[[{"t":"Plain","c":[{"t":"Str","c":"12"}]}],[{"t":"Plain","c":[{"t":"Str","c":"12"}]}],[{"t":"Plain","c":[{"t":"Str","c":"12"}]}],[{"t":"Plain","c":[{"t":"Str","c":"12"}]}]],[[{"t":"Plain","c":[{"t":"Str","c":"123"}]}],[{"t":"Plain","c":[{"t":"Str","c":"123"}]}],[{"t":"Plain","c":[{"t":"Str","c":"123"}]}],[{"t":"Plain","c":[{"t":"Str","c":"123"}]}]],[[{"t":"Plain","c":[{"t":"Str","c":"1"}]}],[{"t":"Plain","c":[{"t":"Str","c":"1"}]}],[{"t":"Plain","c":[{"t":"Str","c":"1"}]}],[{"t":"Plain","c":[{"t":"Str","c":"1"}]}]]]]}|]
+t_table = ( Table
+            ("id", ["kls"], [("k1", "v1"), ("k2", "v2")])
+            (Caption
+             (Just [Str "short"])
+             [Para [Str "Demonstration"
+                   ,Space
+                   ,Str "of"
+                   ,Space
+                   ,Str "simple"
+                   ,Space
+                   ,Str "table"
+                   ,Space
+                   ,Str "syntax."]])
+            [(AlignDefault,ColWidthDefault)
+            ,(AlignRight,ColWidthDefault)
+            ,(AlignLeft,ColWidthDefault)
+            ,(AlignCenter,ColWidthDefault)
+            ,(AlignDefault,ColWidthDefault)]
+            (TableHead ("idh", ["klsh"], [("k1h", "v1h"), ("k2h", "v2h")])
+             [tRow
+              [tCell [Str "Head"]
+              ,tCell [Str "Right"]
+              ,tCell [Str "Left"]
+              ,tCell [Str "Center"]
+              ,tCell [Str "Default"]]])
+            [TableBody ("idb", ["klsb"], [("k1b", "v1b"), ("k2b", "v2b")]) 1
+             [tRow
+              [tCell [Str "ihead12"]
+              ,tCell [Str "i12"]
+              ,tCell [Str "i12"]
+              ,tCell [Str "i12"]
+              ,tCell [Str "i12"]]]
+             [tRow
+              [tCell [Str "head12"]
+              ,tCell' [Str "12"]
+              ,tCell [Str "12"]
+              ,tCell' [Str "12"]
+              ,tCell [Str "12"]]
+            ,tRow
+              [tCell [Str "head123"]
+              ,tCell [Str "123"]
+              ,tCell [Str "123"]
+              ,tCell [Str "123"]
+              ,tCell [Str "123"]]
+            ,tRow
+              [tCell [Str "head1"]
+              ,tCell [Str "1"]
+              ,tCell [Str "1"]
+              ,tCell [Str "1"]
+              ,tCell [Str "1"]]]]
+            (TableFoot ("idf", ["klsf"], [("k1f", "v1f"), ("k2f", "v2f")])
+             [tRow
+              [tCell [Str "foot"]
+              ,tCell [Str "footright"]
+              ,tCell [Str "footleft"]
+              ,tCell [Str "footcenter"]
+              ,tCell [Str "footdefault"]]])
+          ,[s|{"t":"Table","c":[["id",["kls"],[["k1","v1"],["k2","v2"]]],[[{"t":"Str","c":"short"}],[{"t":"Para","c":[{"t":"Str","c":"Demonstration"},{"t":"Space"},{"t":"Str","c":"of"},{"t":"Space"},{"t":"Str","c":"simple"},{"t":"Space"},{"t":"Str","c":"table"},{"t":"Space"},{"t":"Str","c":"syntax."}]}]],[[{"t":"AlignDefault"},{"t":"ColWidthDefault"}],[{"t":"AlignRight"},{"t":"ColWidthDefault"}],[{"t":"AlignLeft"},{"t":"ColWidthDefault"}],[{"t":"AlignCenter"},{"t":"ColWidthDefault"}],[{"t":"AlignDefault"},{"t":"ColWidthDefault"}]],[["idh",["klsh"],[["k1h","v1h"],["k2h","v2h"]]],[[["id",["kls"],[["k1","v1"],["k2","v2"]]],[[["a",["b"],[["c","d"],["e","f"]]],{"t":"AlignDefault"},1,1,[{"t":"Plain","c":[{"t":"Str","c":"Head"}]}]],[["a",["b"],[["c","d"],["e","f"]]],{"t":"AlignDefault"},1,1,[{"t":"Plain","c":[{"t":"Str","c":"Right"}]}]],[["a",["b"],[["c","d"],["e","f"]]],{"t":"AlignDefault"},1,1,[{"t":"Plain","c":[{"t":"Str","c":"Left"}]}]],[["a",["b"],[["c","d"],["e","f"]]],{"t":"AlignDefault"},1,1,[{"t":"Plain","c":[{"t":"Str","c":"Center"}]}]],[["a",["b"],[["c","d"],["e","f"]]],{"t":"AlignDefault"},1,1,[{"t":"Plain","c":[{"t":"Str","c":"Default"}]}]]]]]],[[["idb",["klsb"],[["k1b","v1b"],["k2b","v2b"]]],1,[[["id",["kls"],[["k1","v1"],["k2","v2"]]],[[["a",["b"],[["c","d"],["e","f"]]],{"t":"AlignDefault"},1,1,[{"t":"Plain","c":[{"t":"Str","c":"ihead12"}]}]],[["a",["b"],[["c","d"],["e","f"]]],{"t":"AlignDefault"},1,1,[{"t":"Plain","c":[{"t":"Str","c":"i12"}]}]],[["a",["b"],[["c","d"],["e","f"]]],{"t":"AlignDefault"},1,1,[{"t":"Plain","c":[{"t":"Str","c":"i12"}]}]],[["a",["b"],[["c","d"],["e","f"]]],{"t":"AlignDefault"},1,1,[{"t":"Plain","c":[{"t":"Str","c":"i12"}]}]],[["a",["b"],[["c","d"],["e","f"]]],{"t":"AlignDefault"},1,1,[{"t":"Plain","c":[{"t":"Str","c":"i12"}]}]]]]],[[["id",["kls"],[["k1","v1"],["k2","v2"]]],[[["a",["b"],[["c","d"],["e","f"]]],{"t":"AlignDefault"},1,1,[{"t":"Plain","c":[{"t":"Str","c":"head12"}]}]],[["id",["kls"],[["k1","v1"],["k2","v2"]]],{"t":"AlignDefault"},1,1,[{"t":"Plain","c":[{"t":"Str","c":"12"}]}]],[["a",["b"],[["c","d"],["e","f"]]],{"t":"AlignDefault"},1,1,[{"t":"Plain","c":[{"t":"Str","c":"12"}]}]],[["id",["kls"],[["k1","v1"],["k2","v2"]]],{"t":"AlignDefault"},1,1,[{"t":"Plain","c":[{"t":"Str","c":"12"}]}]],[["a",["b"],[["c","d"],["e","f"]]],{"t":"AlignDefault"},1,1,[{"t":"Plain","c":[{"t":"Str","c":"12"}]}]]]],[["id",["kls"],[["k1","v1"],["k2","v2"]]],[[["a",["b"],[["c","d"],["e","f"]]],{"t":"AlignDefault"},1,1,[{"t":"Plain","c":[{"t":"Str","c":"head123"}]}]],[["a",["b"],[["c","d"],["e","f"]]],{"t":"AlignDefault"},1,1,[{"t":"Plain","c":[{"t":"Str","c":"123"}]}]],[["a",["b"],[["c","d"],["e","f"]]],{"t":"AlignDefault"},1,1,[{"t":"Plain","c":[{"t":"Str","c":"123"}]}]],[["a",["b"],[["c","d"],["e","f"]]],{"t":"AlignDefault"},1,1,[{"t":"Plain","c":[{"t":"Str","c":"123"}]}]],[["a",["b"],[["c","d"],["e","f"]]],{"t":"AlignDefault"},1,1,[{"t":"Plain","c":[{"t":"Str","c":"123"}]}]]]],[["id",["kls"],[["k1","v1"],["k2","v2"]]],[[["a",["b"],[["c","d"],["e","f"]]],{"t":"AlignDefault"},1,1,[{"t":"Plain","c":[{"t":"Str","c":"head1"}]}]],[["a",["b"],[["c","d"],["e","f"]]],{"t":"AlignDefault"},1,1,[{"t":"Plain","c":[{"t":"Str","c":"1"}]}]],[["a",["b"],[["c","d"],["e","f"]]],{"t":"AlignDefault"},1,1,[{"t":"Plain","c":[{"t":"Str","c":"1"}]}]],[["a",["b"],[["c","d"],["e","f"]]],{"t":"AlignDefault"},1,1,[{"t":"Plain","c":[{"t":"Str","c":"1"}]}]],[["a",["b"],[["c","d"],["e","f"]]],{"t":"AlignDefault"},1,1,[{"t":"Plain","c":[{"t":"Str","c":"1"}]}]]]]]]],[["idf",["klsf"],[["k1f","v1f"],["k2f","v2f"]]],[[["id",["kls"],[["k1","v1"],["k2","v2"]]],[[["a",["b"],[["c","d"],["e","f"]]],{"t":"AlignDefault"},1,1,[{"t":"Plain","c":[{"t":"Str","c":"foot"}]}]],[["a",["b"],[["c","d"],["e","f"]]],{"t":"AlignDefault"},1,1,[{"t":"Plain","c":[{"t":"Str","c":"footright"}]}]],[["a",["b"],[["c","d"],["e","f"]]],{"t":"AlignDefault"},1,1,[{"t":"Plain","c":[{"t":"Str","c":"footleft"}]}]],[["a",["b"],[["c","d"],["e","f"]]],{"t":"AlignDefault"},1,1,[{"t":"Plain","c":[{"t":"Str","c":"footcenter"}]}]],[["a",["b"],[["c","d"],["e","f"]]],{"t":"AlignDefault"},1,1,[{"t":"Plain","c":[{"t":"Str","c":"footdefault"}]}]]]]]]]}|]
               )
+  where
+    tCell i = Cell ("a", ["b"], [("c", "d"), ("e", "f")]) AlignDefault 1 1 [Plain i]
+    tCell' i = Cell ("id", ["kls"], [("k1", "v1"), ("k2", "v2")]) AlignDefault 1 1 [Plain i]
+    tRow = Row ("id", ["kls"], [("k1", "v1"), ("k2", "v2")])
 
 t_div :: (Block, ByteString)
 t_div = ( Div ("id", ["kls"], [("k1", "v1"), ("k2", "v2")]) [Para [Str "Hello"]]
@@ -363,6 +462,7 @@ t_null = (Null, [s|{"t":"Null"}|])
 -- headers and rows are padded to a consistent number of
 -- cells in order to avoid syntax errors after conversion, see
 -- jgm/pandoc#4059.
+-- This may change as the table representation changes.
 t_tableSan :: Test
 t_tableSan = testCase "table sanitisation" assertion
              where assertion = assertEqual err expected generated
@@ -371,22 +471,214 @@ t_tableSan = testCase "table sanitisation" assertion
                                   [plain (text "foo"), plain (text "bar")]
                                   [[mempty]
                                   ,[]]
+                   tCell i = Cell nullAttr AlignDefault 1 1 [Plain [Str i]]
+                   emptyRow = Row nullAttr $ replicate 2 emptyCell
                    expected = singleton (Table
-                                         []
-                                         [AlignDefault, AlignDefault]
-                                         [0.0, 0.0]
-                                         [[Plain [Str "foo"]],
-                                          [Plain [Str "bar"]]]
-                                         [[[], []], [[], []]])
+                                          nullAttr
+                                          (Caption Nothing [])
+                                          [(AlignDefault,ColWidthDefault)
+                                          ,(AlignDefault,ColWidthDefault)]
+                                          (TableHead nullAttr
+                                           [Row nullAttr
+                                            [tCell "foo"
+                                            ,tCell "bar"]])
+                                          [TableBody nullAttr 0
+                                           []
+                                           [emptyRow
+                                           ,emptyRow]]
+                                         (TableFoot nullAttr
+                                          []))
 
+withWidth :: Testable prop => (Int -> prop) -> Property
+withWidth = forAll $ choose (2 :: Int, 16)
+
+widthNormIsIdempotent :: (Arbitrary a, Show a, Eq a)
+                      => (Int -> a -> a) -> Property
+widthNormIsIdempotent f = withWidth $
+  \n a -> let a' = f n a in f n a' == a'
+
+p_tableNormHeadIdempotent :: Property
+p_tableNormHeadIdempotent = widthNormIsIdempotent normalizeTableHead
+
+p_tableNormBodyIdempotent :: Property
+p_tableNormBodyIdempotent = widthNormIsIdempotent normalizeTableBody
+
+p_tableNormFootIdempotent :: Property
+p_tableNormFootIdempotent = widthNormIsIdempotent normalizeTableFoot
+
+cellSubset :: Cell -> Cell -> Bool
+cellSubset (Cell attr1 align1 rs1 cs1 body1) (Cell attr2 align2 rs2 cs2 body2)
+  = and [ attr1 == attr2
+        , align1 == align2
+        , dimValid rs1 rs2
+        , dimValid cs1 cs2
+        , body1 == body2 ]
+  where
+    dimValid x y = (y < 1 && x == 1) || (x >= 1 && x <= y)
+
+-- True when the first list is an initial segment of the second,
+-- modulo cell subsetting and the appending of padding cells onto the
+-- second.
+cellsSubsetPad :: [Cell] -> [Cell] -> Bool
+cellsSubsetPad (x:xs) (y:ys) = cellSubset x y && cellsSubsetPad xs ys
+cellsSubsetPad xs _ = all isPadCell xs
+  where
+    isPadCell = (== emptyCell)
+
+-- Only valid for the TableHead and TableFoot. See also
+-- p_tableNormBodyIsSubset.
+rowSubset :: Row -> Row -> Bool
+rowSubset (Row a1 x1) (Row a2 x2) = a1 == a2 && cellsSubsetPad x1 x2
+
+-- The remarks in rowSubset apply.
+rowsSubset :: [Row] -> [Row] -> Bool
+rowsSubset (x:xs) (y:ys) = rowSubset x y && rowsSubset xs ys
+rowsSubset []     _      = True
+rowsSubset (_:_)  []     = False
+
+normIsSubset :: (Arbitrary a, Show a, Eq a)
+             => (Int -> a -> a)
+             -> (a -> [Row])
+             -> Property
+normIsSubset f proj = withWidth $
+  \n a -> let a' = f n a in proj a' `rowsSubset` proj a
+
+p_tableNormHeadIsSubset :: Property
+p_tableNormHeadIsSubset = normIsSubset normalizeTableHead thproj
+  where
+    thproj (TableHead _ r) = r
+
+-- Checking that each row is a subset of its unnormalized version is a
+-- little onerous in the TableBody (because of the row head/row body
+-- distinction), so we settle for testing it only for the first row of
+-- the intermediate body. The intermediate head is still checked
+-- fully.
+p_tableNormBodyIsSubset :: Property
+p_tableNormBodyIsSubset = withWidth $
+  \n tb -> checkBody n (normalizeTableBody n tb) tb
+  where
+    cellLength (Cell _ _ _ (ColSpan w) _) = w
+    cellLengths = sum . map cellLength
+    gatherLen n = gatherLen' n 0
+    gatherLen' n count (c:cs) | count < n
+      = let (beg, end) = gatherLen' n (count + cellLength c) cs
+        in (c : beg, end)
+    gatherLen' _ _ cs = ([], cs)
+    -- Gather as much of the head as we can from the new and old rows,
+    -- then make sure the dimensions line up and the subsetting is
+    -- correct.
+    checkRow n rhc (Row _ r') (Row _ r)
+      = let (rhead', rbody') = gatherLen rhc r'
+            (rhead, rbody) = gatherLen rhc r
+        in and [ cellLengths rhead' == rhc
+               , rhc + cellLengths rbody' == n
+               , cellsSubsetPad rhead' rhead
+               , cellsSubsetPad rbody' rbody ]
+    checkRows n rhc (r':_) (r:_) = checkRow n rhc r' r
+    checkRows _ _   []     []    = True
+    checkRows _ _   _      _     = False
+    checkBody n (TableBody _ (RowHeadColumns rhc) th' tb') (TableBody _ _ th tb)
+      = rowsSubset th' th && checkRows n rhc tb' tb
+
+p_tableNormFootIsSubset :: Property
+p_tableNormFootIsSubset = normIsSubset normalizeTableFoot tfproj
+  where
+    tfproj (TableFoot _ r) = r
+
+-- True when the first row in a section (table head, table foot,
+-- intermediate header, body of table body) has the correct
+-- width. Only with the first row is it easy to check.
+firstRowCorrectWidth :: Int -> [Row] -> [Row] -> Bool
+firstRowCorrectWidth n (Row _ cs:_) (_:_) = n == sum (map cellLength cs)
+  where cellLength (Cell _ _ _ (ColSpan w) _) = w
+firstRowCorrectWidth _ []           []    = True
+firstRowCorrectWidth _ _            _     = False
+
+testRowCorrectWidth :: (Arbitrary a, Show a, Eq a)
+                     => (Int -> a -> a)
+                     -> (a -> [Row])
+                     -> Property
+testRowCorrectWidth f proj = withWidth $
+  \n a -> let a' = f n a in firstRowCorrectWidth n (proj a') (proj a)
+
+p_tableNormHeadRowWidth :: Property
+p_tableNormHeadRowWidth = testRowCorrectWidth normalizeTableHead thproj
+  where
+    thproj (TableHead _ r) = r
+
+p_tableNormBodyRowWidth :: Property
+p_tableNormBodyRowWidth = withWidth $
+  \n tb -> compBody n tb $ normalizeTableBody n tb
+  where
+    compBody n (TableBody _ _ th tb) (TableBody _ _ th' tb')
+      = firstRowCorrectWidth n th' th && firstRowCorrectWidth n tb' tb
+
+p_tableNormFootRowWidth :: Property
+p_tableNormFootRowWidth = testRowCorrectWidth normalizeTableFoot tfproj
+  where
+    tfproj (TableFoot _ r) = r
+
+t_tableNormExample :: Test
+t_tableNormExample = testCase "table normalization example" assertion
+  where
+    assertion = assertEqual "normalization error" expected generated
+    cl a h w = Cell (a, [], []) AlignDefault h w []
+    rws = map $ Row nullAttr
+    th = TableHead nullAttr . rws
+    tb n x y = TableBody nullAttr n (rws x) (rws y)
+    tf = TableFoot nullAttr . rws
+    initialHeads =
+      [[cl "a" 1 1,cl "b" 3 2]
+      ,[cl "c" 2 2           ,cl "d" 1 1]
+      ]
+    finalHeads =
+      [[cl "a" 1 1, cl "b" 2 2]
+      ,[cl "c" 1 1]
+      ]
+    initialTB = tb 1
+      [[]
+      ,[cl "g" (-7) 0,cl "h" 4 1]]
+      [[cl "e" 4 3   ,cl "f" 4 3]
+      ,[]
+      ,[emptyCell]
+      ]
+    finalTB = tb 1
+      [[emptyCell,emptyCell,emptyCell]
+      ,[cl "g" 1 1,cl "h" 1 1,emptyCell]]
+      [[cl "e" 3 1,cl "f" 3 2]
+      ,[]
+      ,[]]
+    spec = replicate 3 (AlignDefault, ColWidthDefault)
+    expected = singleton $ Table nullAttr
+                                 emptyCaption
+                                 spec
+                                 (th finalHeads)
+                                 [finalTB]
+                                 (tf finalHeads)
+    generated = table emptyCaption spec (th initialHeads) [initialTB] (tf initialHeads)
+
+p_figureRepresentation :: Property
+p_figureRepresentation = forAll (arbitrary :: Gen [Inline]) (\figureCaption ->
+  simpleFigureWith
+      ("", [], [])
+      (Builder.fromList figureCaption)
+      "url"
+      "title" ==
+      Builder.fromList
+          [Para [Image ("", [], []) figureCaption ("url", "fig:title") ]]
+  )
 
 tests :: [Test]
 tests =
   [ testGroup "Walk"
     [ testProperty "p_walk inlineTrans" (p_walk inlineTrans)
     , testProperty "p_walk blockTrans" (p_walk blockTrans)
+    , testProperty "p_walk metaValueTrans" (p_walk metaValueTrans)
+    , testProperty "p_walk metaTrans" (p_walk metaTrans)
     , testProperty "p_query inlineQuery" (p_query inlineQuery)
     , testProperty "p_query blockQuery" (p_query blockQuery)
+    , testProperty "p_query metaValueQuery" (p_query metaValueQuery)
+    , testProperty "p_query metaQuery" (p_query metaQuery)
     , testProperty "p_walkList inlinesTrans"  (p_walkList inlinesTrans)
     , testProperty "p_queryList inlinesQuery" (p_queryList inlinesQuery)
     , testProperty "p_walkList blocksTrans"  (p_walkList blocksTrans)
@@ -398,7 +690,8 @@ tests =
       ]
     , testGroup "JSON encoding/decoding"
       [ testGroup "Meta"
-        [ testEncodeDecode "MetaMap" t_metamap
+        [ testEncodeDecode "Meta" t_meta
+        , testEncodeDecode "MetaMap" t_metamap
         , testEncodeDecode "MetaList" t_metalist
         , testEncodeDecode "MetaBool" t_metabool
         , testEncodeDecode "MetaString" t_metastring
@@ -422,6 +715,7 @@ tests =
       , testGroup "Inline"
         [ testEncodeDecode "Str" t_str
         , testEncodeDecode "Emph" t_emph
+        , testEncodeDecode "Underline" t_underline
         , testEncodeDecode "Strong" t_strong
         , testEncodeDecode "Strikeout" t_strikeout
         , testEncodeDecode "Superscript" t_superscript
@@ -454,11 +748,37 @@ tests =
         , testEncodeDecode "Div" t_div
         , testEncodeDecode "Null" t_null
         ]
+      , testGroup "Table"
+        [ testEncodeDecode "Row" t_row
+        , testEncodeDecode "Caption" t_caption
+        , testEncodeDecode "TableHead" t_tablehead
+        , testEncodeDecode "TableBody" t_tablebody
+        , testEncodeDecode "TableFoot" t_tablefoot
+        , testEncodeDecode "Cell" t_cell
+        , testEncodeDecode "RowHeadColumns" t_rowheadcolumns
+        , testEncodeDecode "RowSpan" t_rowspan
+        , testEncodeDecode "ColSpan" t_colspan
+        ]
       ]
-    ],
-    t_tableSan
+    ]
+  , testGroup "Table normalization"
+    [ testProperty "p_tableNormHeadIdempotent" p_tableNormHeadIdempotent
+    , testProperty "p_tableNormBodyIdempotent" p_tableNormBodyIdempotent
+    , testProperty "p_tableNormFootIdempotent" p_tableNormFootIdempotent
+    , testProperty "p_tableNormHeadIsSubset" p_tableNormHeadIsSubset
+    , testProperty "p_tableNormBodyIsSubset" p_tableNormBodyIsSubset
+    , testProperty "p_tableNormFootIsSubset" p_tableNormFootIsSubset
+    , testProperty "p_tableNormHeadRowWidth" p_tableNormHeadRowWidth
+    , testProperty "p_tableNormBodyRowWidth" p_tableNormBodyRowWidth
+    , testProperty "p_tableNormFootRowWidth" p_tableNormFootRowWidth
+    ]
+  , t_tableSan
+  , t_tableNormExample
+  , testGroup "Figure"
+    [ testProperty "p_figureRepresentation figure representation" p_figureRepresentation ]
   ]
 
 
 main :: IO ()
 main = defaultMain tests
+
