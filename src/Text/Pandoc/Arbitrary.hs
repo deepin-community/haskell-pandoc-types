@@ -44,6 +44,7 @@ instance Arbitrary Inlines where
           flattenInline :: Inline -> [Inline]
           flattenInline (Str _) = []
           flattenInline (Emph ils) = ils
+          flattenInline (Underline ils) = ils
           flattenInline (Strong ils) = ils
           flattenInline (Strikeout ils) = ils
           flattenInline (Superscript ils) = ils
@@ -81,9 +82,23 @@ instance Arbitrary Blocks where
           flattenBlock (DefinitionList defs) = concat [Para ils:concat blks | (ils, blks) <- defs]
           flattenBlock (Header _ _ ils) = [Para ils]
           flattenBlock HorizontalRule = []
-          flattenBlock (Table caption _ _ cells rows) = Para caption : concat (concat $ cells:rows)
+          flattenBlock (Table _ capt _ hd bd ft) = flattenCaption capt <>
+                                                   flattenTableHead hd <>
+                                                   concatMap flattenTableBody bd <>
+                                                   flattenTableFoot ft
           flattenBlock (Div _ blks) = blks
           flattenBlock Null = []
+
+          flattenCaption (Caption Nothing body)    = body
+          flattenCaption (Caption (Just ils) body) = Para ils : body
+
+          flattenTableHead (TableHead _ body) = flattenRows body
+          flattenTableBody (TableBody _ _ hd bd) = flattenRows hd <> flattenRows bd
+          flattenTableFoot (TableFoot _ body) = flattenRows body
+
+          flattenRows = concatMap flattenRow
+          flattenRow (Row _ body) = concatMap flattenCell body
+          flattenCell (Cell _ _ _ _ blks) = blks
 
 shrinkInlineList :: [Inline] -> [[Inline]]
 shrinkInlineList = fmap toList . shrink . fromList
@@ -101,6 +116,7 @@ instance Arbitrary Inline where
   arbitrary = resize 3 $ arbInline 2
   shrink (Str s) = Str <$> shrinkText s
   shrink (Emph ils) = Emph <$> shrinkInlineList ils
+  shrink (Underline ils) = Underline <$> shrinkInlineList ils
   shrink (Strong ils) = Strong <$> shrinkInlineList ils
   shrink (Strikeout ils) = Strikeout <$> shrinkInlineList ils
   shrink (Superscript ils) = Superscript <$> shrinkInlineList ils
@@ -145,6 +161,7 @@ arbInline n = frequency $ [ (60, Str <$> realString)
                                           , RawInline (Format "latex") "\\my{command}" ])
                           ] ++ [ x | n > 1, x <- nesters]
    where nesters = [ (10, Emph <$> arbInlines (n-1))
+                   , (10, Underline <$> arbInlines (n-1))
                    , (10, Strong <$> arbInlines (n-1))
                    , (10, Strikeout <$> arbInlines (n-1))
                    , (10, Superscript <$> arbInlines (n-1))
@@ -180,24 +197,13 @@ instance Arbitrary Block where
   shrink (Header n attr ils) = (Header n attr <$> shrinkInlineList ils)
                             ++ (flip (Header n) ils <$> shrinkAttr attr)
   shrink HorizontalRule = []
-  shrink (Table caption aligns widths cells rows) =
+  shrink (Table attr capt specs thead tbody tfoot) =
     -- TODO: shrink number of columns
-    -- Shrink header contents
-    [Table caption aligns widths cells' rows | cells' <- shrinkRow cells] ++
-    -- Shrink number of rows and row contents
-    [Table caption aligns widths cells rows' | rows' <- shrinkRows rows] ++
-    -- Shrink caption
-    [Table caption' aligns widths cells rows | caption' <- shrinkInlineList caption]
-    where -- Shrink row contents without reducing the number of columns
-          shrinkRow :: [TableCell] -> [[TableCell]]
-          shrinkRow (x:xs) = [x':xs | x' <- shrinkBlockList x]
-                          ++ [x:xs' | xs' <- shrinkRow xs]
-          shrinkRow [] = []
-          shrinkRows :: [[TableCell]] -> [[[TableCell]]]
-          shrinkRows (x:xs) = [xs] -- Shrink number of rows
-                           ++ [x':xs | x' <- shrinkRow x] -- Shrink row contents
-                           ++ [x:xs' | xs' <- shrinkRows xs]
-          shrinkRows [] = []
+    [Table attr' capt specs thead tbody tfoot | attr' <- shrinkAttr attr] ++
+    [Table attr capt specs thead' tbody tfoot | thead' <- shrink thead] ++
+    [Table attr capt specs thead tbody' tfoot | tbody' <- shrink tbody] ++
+    [Table attr capt specs thead tbody tfoot' | tfoot' <- shrink tfoot] ++
+    [Table attr capt' specs thead tbody tfoot | capt' <- shrink capt]
   shrink (Div attr blks) = (Div attr <$> shrinkBlockList blks)
                         ++ (flip Div blks <$> shrinkAttr attr)
   shrink Null = []
@@ -229,14 +235,50 @@ arbBlock n = frequency $ [ (10, Plain <$> arbInlines (n-1))
                    , (5, DefinitionList <$> listOf1 ((,) <$> arbInlines (n-1)
                                                           <*> listOf1 (listOf1 $ arbBlock (n-1))))
                    , (5, Div <$> arbAttr <*> listOf1 (arbBlock (n-1)))
-                   , (2, do rs <- choose (1 :: Int, 4)
-                            cs <- choose (1 :: Int, 4)
-                            Table <$> arbInlines (n-1)
-                                  <*> vector cs
-                                  <*> vectorOf cs (elements [0, 0.25])
-                                  <*> vectorOf cs (listOf $ arbBlock (n-1))
-                                  <*> vectorOf rs (vectorOf cs $ listOf $ arbBlock (n-1)))
+                   , (2, do cs <- choose (1 :: Int, 6)
+                            bs <- choose (0 :: Int, 2)
+                            Table <$> arbAttr
+                                  <*> arbitrary
+                                  <*> vectorOf cs ((,) <$> arbitrary
+                                                       <*> elements [ ColWidthDefault
+                                                                    , ColWidth (1/3)
+                                                                    , ColWidth 0.25 ])
+                                  <*> arbTableHead (n-1)
+                                  <*> vectorOf bs (arbTableBody (n-1))
+                                  <*> arbTableFoot (n-1))
                    ]
+
+arbRow :: Int -> Gen Row
+arbRow n = do
+  cs <- choose (0, 5)
+  Row <$> arbAttr <*> vectorOf cs (arbCell n)
+
+arbTableHead :: Int -> Gen TableHead
+arbTableHead n = do
+  rs <- choose (0, 5)
+  TableHead <$> arbAttr <*> vectorOf rs (arbRow n)
+
+arbTableBody :: Int -> Gen TableBody
+arbTableBody n = do
+  hrs <- choose (0 :: Int, 2)
+  rs <- choose (0, 5)
+  rhc <- choose (0, 5)
+  TableBody <$> arbAttr
+            <*> pure (RowHeadColumns rhc)
+            <*> vectorOf hrs (arbRow n)
+            <*> vectorOf rs (arbRow n)
+
+arbTableFoot :: Int -> Gen TableFoot
+arbTableFoot n = do
+    rs <- choose (0, 5)
+    TableFoot <$> arbAttr <*> vectorOf rs (arbRow n)
+
+arbCell :: Int -> Gen Cell
+arbCell n = Cell <$> arbAttr
+                 <*> arbitrary
+                 <*> (RowSpan <$> choose (1 :: Int, 2))
+                 <*> (ColSpan <$> choose (1 :: Int, 2))
+                 <*> listOf (arbBlock n)
 
 instance Arbitrary Pandoc where
         arbitrary = resize 8 (Pandoc <$> arbitrary <*> arbitrary)
@@ -259,6 +301,45 @@ instance Arbitrary Citation where
                      <*> arbitrary
                      <*> arbitrary
 
+instance Arbitrary Row where
+  arbitrary = resize 3 $ arbRow 2
+  shrink (Row attr body)
+    = [Row attr' body | attr' <- shrinkAttr attr] ++
+      [Row attr body' | body' <- shrink body]
+
+instance Arbitrary TableHead where
+  arbitrary = resize 3 $ arbTableHead 2
+  shrink (TableHead attr body)
+    = [TableHead attr' body | attr' <- shrinkAttr attr] ++
+      [TableHead attr body' | body' <- shrink body]
+
+instance Arbitrary TableBody where
+  arbitrary = resize 3 $ arbTableBody 2
+  -- TODO: shrink rhc?
+  shrink (TableBody attr rhc hd bd)
+    = [TableBody attr' rhc hd bd | attr' <- shrinkAttr attr] ++
+      [TableBody attr rhc hd' bd | hd' <- shrink hd] ++
+      [TableBody attr rhc hd bd' | bd' <- shrink bd]
+
+instance Arbitrary TableFoot where
+  arbitrary = resize 3 $ arbTableFoot 2
+  shrink (TableFoot attr body)
+    = [TableFoot attr' body | attr' <- shrinkAttr attr] ++
+      [TableFoot attr body' | body' <- shrink body]
+
+instance Arbitrary Cell where
+  arbitrary = resize 3 $ arbCell 2
+  shrink (Cell attr malign h w body)
+    = [Cell attr malign h w body' | body' <- shrinkBlockList body] ++
+      [Cell attr' malign h w body | attr' <- shrinkAttr attr] ++
+      [Cell attr malign' h w body | malign' <- shrink malign]
+
+instance Arbitrary Caption where
+  arbitrary = Caption <$> arbitrary <*> arbitrary
+  shrink (Caption mshort body)
+    = [Caption mshort' body | mshort' <- shrink mshort] ++
+      [Caption mshort body' | body' <- shrinkBlockList body]
+
 instance Arbitrary MathType where
         arbitrary
           = do x <- choose (0 :: Int, 1)
@@ -278,7 +359,7 @@ instance Arbitrary QuoteType where
 instance Arbitrary Meta where
         arbitrary
           = do (x1 :: Inlines) <- arbitrary
-               (x2 :: [Inlines]) <- filter (not . isNull) <$> arbitrary
+               (x2 :: [Inlines]) <- filter (not . null) <$> arbitrary
                (x3 :: Inlines) <- arbitrary
                return $ setMeta "title" x1
                       $ setMeta "author" x2
